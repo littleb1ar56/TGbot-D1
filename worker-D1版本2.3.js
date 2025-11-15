@@ -466,19 +466,20 @@ async function dbConfigGet(key, env) {
     const isPrimary = isPrimaryAdmin(userId, env);
     // 检查是否是任意管理员 (主管理员或授权协管员)
     const isAdmin = await isAdminUser(userId, env);
+    // 从 D1 获取用户数据
+    const user = await dbUserGetOrCreate(userId, env);  
     
     // 1. 检查 /start 或 /help 命令
     if (text === "/start" || text === "/help") {
-        if (isPrimary) { // 只有主管理员能访问配置菜单
-            await handleAdminConfigStart(chatId, env);
-        } else {
-            await handleStart(chatId, env);
+        if (isPrimary) { await handleAdminConfigStart(chatId, env); return; }
+        if (user.user_state === "verified") {
+            await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "你已完成验证，可以直接发送消息。", });
+            return;
         }
+        await handleStart(chatId, env); // 只对未验证用户送题
         return;
     }
     
-    // 从 D1 获取用户数据
-    const user = await dbUserGetOrCreate(userId, env);
     const isBlocked = user.is_blocked;
   
     if (isBlocked) {
@@ -699,6 +700,13 @@ async function dbConfigGet(key, env) {
   // --- 验证逻辑 (使用 D1) ---
   
   async function handleStart(chatId, env) {
+    const u = await dbUserGetOrCreate(chatId, env);
+    if (u.user_state === "verified") {
+      // 已验证用户不降级
+      await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "你已完成验证，直接发消息即可。" });
+      return;
+    }
+    
     const welcomeMessage = await getConfig('welcome_msg', env, "欢迎！在使用之前，请先完成人机验证。");
     
     const defaultVerificationQuestion = 
@@ -713,13 +721,17 @@ async function dbConfigGet(key, env) {
     await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: verificationQuestion });
     
     // 更新 D1 中的用户状态
-    await dbUserUpdate(chatId, { user_state: "pending_verification" }, env);
+    if (u.user_state !== "pending_verification") {
+        await dbUserUpdate(chatId, { user_state: "pending_verification" }, env);
+    }
   }
   
   async function handleVerification(chatId, answer, env) {
-    const expectedAnswer = await getConfig('verif_a', env, "3"); 
+    const raw = await getConfig('verif_a', env, "3");
+    const norm = s => { try { return s.normalize("NFKC").trim().toLowerCase(); } catch { return (s||"").trim().toLowerCase(); } };
+    const candidates = (() => { try { const arr = JSON.parse(raw); if (Array.isArray(arr)) return arr; } catch(_){} return String(raw).split('|'); })().map(norm);
   
-    if (answer.trim() === expectedAnswer.trim()) {
+    if (candidates.includes(norm(answer))) {
         await telegramApi(env.BOT_TOKEN, "sendMessage", {
             chat_id: chatId,
             text: "✅ 验证通过！您现在可以发送消息了。",
@@ -1405,7 +1417,7 @@ async function dbConfigGet(key, env) {
         
         if (key === 'welcome_msg') prompt = "请输入新的欢迎消息：";
         else if (key === 'verif_q') prompt = "请输入新的验证问题：";
-        else if (key === 'verif_a') prompt = "请输入新的验证答案：";
+        else if (key === 'verif_a') prompt = "请输入新的验证答案（支持多个验证答案，多个答案中请用|分隔。）：";
         else if (key === 'block_threshold') prompt = "请输入新的屏蔽次数阈值（纯数字）：";
         else if (key === 'backup_group_id') prompt = "请输入备份群组的 ID 或 @用户名：";
         else if (key === 'authorized_admins') prompt = "请输入新的协管员 ID 或 @用户名（多个用逗号分隔）：";
