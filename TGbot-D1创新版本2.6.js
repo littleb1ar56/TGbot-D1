@@ -181,7 +181,8 @@ async function dbMigrate(env) {
         const addColumns = [
             "ALTER TABLE users ADD COLUMN is_muted INTEGER DEFAULT 0",
             "ALTER TABLE users ADD COLUMN info_card_message_id TEXT",
-            "ALTER TABLE users ADD COLUMN block_log_message_id TEXT" // <--- 新增这一行
+            "ALTER TABLE users ADD COLUMN block_log_message_id TEXT",
+            "ALTER TABLE users ADD COLUMN profile_log_message_id TEXT" // <--- 新增这一行
         ];
   
         for (const query of addColumns) {
@@ -1495,17 +1496,21 @@ async function ensureBlockLogTopicExists(env) {
                     // 尝试发送
                     const sendParams = { chat_id: env.ADMIN_GROUP_ID, message_thread_id: logTopicId, text: logText, parse_mode: "HTML", reply_markup: logMarkup };
                     try {
-                        await telegramApi(env.BOT_TOKEN, "sendMessage", sendParams);
+                        // [⭐️ 关键修改] 获取发送结果，并保存 ID 到 profile_log_message_id
+                        const logMsg = await telegramApi(env.BOT_TOKEN, "sendMessage", sendParams);
+                        await dbUserUpdate(userId, { profile_log_message_id: logMsg.message_id.toString() }, env);
                     } catch (sendErr) {
                         // 简单的错误重试逻辑
                         const errStr = sendErr.message || sendErr.toString();
                         if (errStr.includes("thread not found") || errStr.includes("TOPIC_DELETED")) {
-                             await env.TG_BOT_DB.prepare("DELETE FROM config WHERE key = ?").bind('user_profile_log_topic_id').run();
-                             logTopicId = await ensureLogTopicExists(env);
-                             if (logTopicId) {
-                                 sendParams.message_thread_id = logTopicId;
-                                 await telegramApi(env.BOT_TOKEN, "sendMessage", sendParams);
-                             }
+                                await env.TG_BOT_DB.prepare("DELETE FROM config WHERE key = ?").bind('user_profile_log_topic_id').run();
+                                logTopicId = await ensureLogTopicExists(env);
+                                if (logTopicId) {
+                                    sendParams.message_thread_id = logTopicId;
+                                    const retryMsg = await telegramApi(env.BOT_TOKEN, "sendMessage", sendParams);
+                                    // 重试成功也要保存 ID
+                                    await dbUserUpdate(userId, { profile_log_message_id: retryMsg.message_id.toString() }, env);
+                                }
                         }
                     }
                 }
@@ -1851,18 +1856,20 @@ async function syncToBlockLog(userId, user, isBlocked, isMuted, env) {
     }
 }
   
-  async function handleCallbackQuery(callbackQuery, env) {
+// [⭐️ 修改 3] 完全替换 handleCallbackQuery 函数
+async function handleCallbackQuery(callbackQuery, env) {
     const chatId = callbackQuery.from.id.toString();
     const data = callbackQuery.data;
     const message = callbackQuery.message;
   
-    // 确保是主管理员或授权协管员，以处理管理菜单相关的回调
+    // 1. 权限检查
     const isAdmin = await isAdminUser(chatId, env);
     if (!isAdmin) {
         await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callbackQuery.id, text: "您无权操作此菜单。", show_alert: true });
         return;
     }
     
+    // 2. 配置菜单处理 (保持不变)
     if (data.startsWith('config:')) {
         const parts = data.split(':');
         const actionType = parts[1]; 
@@ -1923,239 +1930,164 @@ async function syncToBlockLog(userId, user, isBlocked, isMuted, env) {
         return;
     } 
   
-    // 非配置相关的操作（屏蔽/置顶/静音）
+    // 3. 屏蔽/静音/置顶 操作处理
     if (message.chat.id.toString() !== env.ADMIN_GROUP_ID) {
         return;
     }
   
-    const [action, userId] = data.split(':');
-    const topicId = message.message_thread_id ? message.message_thread_id.toString() : null;
-
-  // 1. 屏蔽/解禁操作
-  if (action === 'block' || action === 'unblock') {
-    try {
-        const isBlocking = action === 'block';
-        // 1. 更新数据库状态
-        await dbUserUpdate(userId, { is_blocked: isBlocking }, env);
-        
-        // 2. 获取最新用户数据 (为了拿到 topic_id, is_muted, block_log_message_id 等)
-        const user = await dbUserGetOrCreate(userId, env);
-        const userName = user.user_info?.name || userId;
-        
-        // 3. 生成新按钮
-        const newMarkup = getInfoCardButtons(userId, isBlocking, user.is_muted);
-
-        // 4. 更新【当前被点击】的这条消息的按钮 (无论在哪个话题)
-        //    我们要保留原来的 "跳转" 按钮(如果有的话)
-        let currentMsgMarkup = JSON.parse(JSON.stringify(newMarkup));
-        if (message.reply_markup && message.reply_markup.inline_keyboard) {
-           const lastRow = message.reply_markup.inline_keyboard[message.reply_markup.inline_keyboard.length - 1];
-           // 如果最后一行是跳转链接，保留它
-           if (lastRow && lastRow[0] && lastRow[0].url && lastRow[0].url.includes('t.me/c/')) {
-               currentMsgMarkup.inline_keyboard.push(lastRow); 
-           }
-        }
-        
-        await telegramApi(env.BOT_TOKEN, "editMessageReplyMarkup", {
-            chat_id: message.chat.id,
-            message_id: message.message_id,
-            reply_markup: currentMsgMarkup,
-        });
-
-        // 5. 发送文字提示 (仅在用户话题内才发，避免在名单里刷屏)
-        if (topicId && topicId === user.topic_id) {
-            const confirmation = isBlocking 
-                ? `❌ **用户 [${userName}] 已被屏蔽。**`
-                : `✅ **用户 [${userName}] 已解除屏蔽。**`;
-            await telegramApi(env.BOT_TOKEN, "sendMessage", {
+    const [action, targetUserId] = data.split(':');
+    const currentTopicId = message.message_thread_id ? message.message_thread_id.toString() : null;
+  
+    // 获取用户当前数据
+    let user = await dbUserGetOrCreate(targetUserId, env);
+    
+    // --- [⭐️ 自动关联逻辑修复] ---
+    // 1. 关联私聊话题卡片 ID
+    if (user.topic_id === currentTopicId && !user.info_card_message_id) {
+        await dbUserUpdate(targetUserId, { info_card_message_id: message.message_id.toString() }, env);
+        user.info_card_message_id = message.message_id.toString();
+    }
+    
+    // 2. 关联屏蔽名单日志 ID
+    const blockLogTopicId = await dbConfigGet('user_block_log_topic_id', env);
+    if (blockLogTopicId === currentTopicId && !user.block_log_message_id) {
+        await dbUserUpdate(targetUserId, { block_log_message_id: message.message_id.toString() }, env);
+        user.block_log_message_id = message.message_id.toString();
+    }
+  
+    // 3. [⭐️ 新增] 关联资料卡汇总日志 ID
+    const profileLogTopicId = await dbConfigGet('user_profile_log_topic_id', env);
+    if (profileLogTopicId === currentTopicId && !user.profile_log_message_id) {
+         await dbUserUpdate(targetUserId, { profile_log_message_id: message.message_id.toString() }, env);
+         user.profile_log_message_id = message.message_id.toString();
+    }
+  
+    // --- 统一处理 Block 和 Mute 逻辑 ---
+    if (['block', 'unblock', 'mute', 'unmute'].includes(action)) {
+        const isBlockAction = action === 'block' || action === 'unblock';
+        const isMuteAction = action === 'mute' || action === 'unmute';
+        const newState = (action === 'block' || action === 'mute'); 
+  
+        try {
+            // A. 更新数据库
+            const updateData = isBlockAction ? { is_blocked: newState } : { is_muted: newState };
+            await dbUserUpdate(targetUserId, updateData, env);
+  
+            // B. 重新获取最新用户数据
+            user = await dbUserGetOrCreate(targetUserId, env);
+            const userName = user.user_info?.name || targetUserId;
+  
+            // C. 生成新的按钮
+            const newMarkup = getInfoCardButtons(targetUserId, user.is_blocked, user.is_muted);
+  
+            // D. 智能保留 "跳转到会话" 按钮 (针对当前点击的消息)
+            const preserveJumpLink = (originalMarkup) => {
+                  let updated = JSON.parse(JSON.stringify(newMarkup));
+                  if (originalMarkup && originalMarkup.inline_keyboard) {
+                      const lastRow = originalMarkup.inline_keyboard[originalMarkup.inline_keyboard.length - 1];
+                      if (lastRow && lastRow[0] && lastRow[0].url && lastRow[0].url.includes('t.me/c/')) {
+                          updated.inline_keyboard.push(lastRow); 
+                      }
+                  }
+                  return updated;
+            };
+  
+            // E. 更新【当前点击】的这条消息
+            await telegramApi(env.BOT_TOKEN, "editMessageReplyMarkup", {
                 chat_id: message.chat.id,
-                text: confirmation,
-                message_thread_id: topicId, 
-                parse_mode: "Markdown",
+                message_id: message.message_id,
+                reply_markup: preserveJumpLink(message.reply_markup),
+            });
+  
+            // F. 发送 Toast 通知
+            let toastText = "";
+            if (isBlockAction) toastText = newState ? "🚫 已屏蔽该用户" : "✅ 已解除屏蔽";
+            else if (isMuteAction) toastText = newState ? "🔕 已静音通知" : "🔔 已恢复通知";
+  
+            await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { 
+                callback_query_id: callbackQuery.id, 
+                text: toastText, 
+                show_alert: false 
+            });
+  
+            // G. 同步到屏蔽/静音名单 (Block Log)
+            await syncToBlockLog(targetUserId, user, user.is_blocked, user.is_muted, env);
+  
+            // H. 同步：私聊话题资料卡 (info_card)
+            if (user.info_card_message_id && message.message_id.toString() !== user.info_card_message_id) {
+                try {
+                    // 私聊资料卡通常没有跳转链接，直接用标准按钮
+                    await telegramApi(env.BOT_TOKEN, "editMessageReplyMarkup", {
+                        chat_id: env.ADMIN_GROUP_ID,
+                        message_id: user.info_card_message_id,
+                        reply_markup: newMarkup, 
+                    });
+                } catch (e) { console.warn("同步私聊资料卡失败:", e.message); }
+            }
+  
+            // I. [⭐️ 新增] 同步：资料卡汇总 (Profile Log)
+            if (user.profile_log_message_id && message.message_id.toString() !== user.profile_log_message_id) {
+                 try {
+                     // 资料卡汇总通常有跳转链接，需要构造带链接的按钮
+                     const cleanGroupId = env.ADMIN_GROUP_ID.toString().replace(/^-100/, '');
+                     const jumpUrl = `https://t.me/c/${cleanGroupId}/${user.topic_id}`;
+                     const logMarkup = JSON.parse(JSON.stringify(newMarkup));
+                     logMarkup.inline_keyboard.push([{ text: "💬 跳转到会话窗口", url: jumpUrl }]);
+                     
+                     await telegramApi(env.BOT_TOKEN, "editMessageReplyMarkup", {
+                         chat_id: env.ADMIN_GROUP_ID,
+                         message_id: user.profile_log_message_id,
+                         reply_markup: logMarkup,
+                     });
+                 } catch (e) { console.warn("同步资料卡汇总失败:", e.message); }
+            }
+            
+            // J. 如果是在用户话题内操作 Block，发一条文本提示
+            if (isBlockAction && currentTopicId && currentTopicId === user.topic_id) {
+                const confirmation = newState 
+                    ? `❌ **用户 [${userName}] 已被屏蔽。**`
+                    : `✅ **用户 [${userName}] 已解除屏蔽。**`;
+                await telegramApi(env.BOT_TOKEN, "sendMessage", {
+                    chat_id: message.chat.id,
+                    text: confirmation,
+                    message_thread_id: currentTopicId, 
+                    parse_mode: "Markdown",
+                });
+            }
+  
+        } catch (e) {
+            console.error(`处理 ${action} 操作失败:`, e.message);
+            await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callbackQuery.id, text: "❌ 操作失败，请重试。", show_alert: true });
+        }
+    }
+    // 4. 置顶操作
+    else if (action === 'pin_card') {
+        try {
+            await telegramApi(env.BOT_TOKEN, "pinChatMessage", {
+                chat_id: message.chat.id,
+                message_id: message.message_id,
+                message_thread_id: currentTopicId,
+                disable_notification: true,
+            });
+            
+            // 自动关联 ID (根据当前所在话题判断是哪种卡片)
+            if (currentTopicId === user.topic_id) {
+                 await dbUserUpdate(targetUserId, { info_card_message_id: message.message_id.toString() }, env);
+            } else if (currentTopicId === await dbConfigGet('user_profile_log_topic_id', env)) {
+                 await dbUserUpdate(targetUserId, { profile_log_message_id: message.message_id.toString() }, env);
+            }
+            
+            await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { 
+                callback_query_id: callbackQuery.id, 
+                text: "✅ 已置顶该资料卡。", 
+                show_alert: false 
+            });
+        } catch (e) {
+            await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { 
+                callback_query_id: callbackQuery.id, 
+                text: `❌ 置顶失败: ${e.message}`, 
+                show_alert: true 
             });
         }
-
-        // 6. [⭐️ 核心修复] 调用通用同步函数
-        //    无论在哪里点击，都去更新“屏蔽名单话题”里的状态
-        await syncToBlockLog(userId, user, isBlocking, user.is_muted, env);
-
-        // 7. 如果是在“用户资料汇总话题”或者“屏蔽名单话题”点击，
-        //    还需要尝试同步更新用户【私聊话题】里的那张资料卡
-        if (topicId !== user.topic_id && user.info_card_message_id) {
-            try {
-                await telegramApi(env.BOT_TOKEN, "editMessageReplyMarkup", {
-                    chat_id: env.ADMIN_GROUP_ID, // 假设都在同一个群
-                    message_id: user.info_card_message_id, 
-                    reply_markup: newMarkup,
-                });
-            } catch (e) {
-                // 忽略错误，可能是原消息已删
-            }
-        }
-
-    } catch (e) {
-        console.error(`处理 ${action} 操作失败:`, e.message);
     }
-} 
-// 2. 静音/解除静音操作
-else if (action === 'mute' || action === 'unmute') {
-    try {
-        const isMuting = action === 'mute';
-        await dbUserUpdate(userId, { is_muted: isMuting }, env);
-        
-        const user = await dbUserGetOrCreate(userId, env);
-        const userName = user.user_info?.name || userId;
-        
-        const newMarkup = getInfoCardButtons(userId, user.is_blocked, isMuting);
-        
-        // 更新当前按钮
-        let currentMsgMarkup = JSON.parse(JSON.stringify(newMarkup));
-        if (message.reply_markup && message.reply_markup.inline_keyboard) {
-            const lastRow = message.reply_markup.inline_keyboard[message.reply_markup.inline_keyboard.length - 1];
-            if (lastRow && lastRow[0] && lastRow[0].url && lastRow[0].url.includes('t.me/c/')) {
-                currentMsgMarkup.inline_keyboard.push(lastRow); 
-            }
-        }
-
-        await telegramApi(env.BOT_TOKEN, "editMessageReplyMarkup", {
-            chat_id: message.chat.id,
-            message_id: message.message_id,
-            reply_markup: currentMsgMarkup,
-        });
-
-        await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { 
-            callback_query_id: callbackQuery.id, 
-            text: isMuting ? "🔕 已静音该用户通知" : "🔔 已恢复该用户通知", 
-            show_alert: false 
-        });
-
-        // [⭐️ 核心修复] 同步到屏蔽名单
-        await syncToBlockLog(userId, user, user.is_blocked, isMuting, env);
-
-        // 远程同步用户话题里的资料卡
-        if (topicId !== user.topic_id && user.info_card_message_id) {
-            try {
-                await telegramApi(env.BOT_TOKEN, "editMessageReplyMarkup", {
-                    chat_id: env.ADMIN_GROUP_ID,
-                    message_id: user.info_card_message_id,
-                    reply_markup: newMarkup,
-                });
-            } catch (e) {}
-        }
-
-    } catch (e) { console.error(`处理 ${action} 操作失败:`, e.message); }
-}
-  // 2. 静音/解除静音操作
-  else if (action === 'mute' || action === 'unmute') {
-      try {
-          const isMuting = action === 'mute';
-          await dbUserUpdate(userId, { is_muted: isMuting }, env);
-          
-          const user = await dbUserGetOrCreate(userId, env);
-          const userName = user.user_info.name || userId;
-          
-          const newMarkup = getInfoCardButtons(userId, user.is_blocked, isMuting);
-          
-          let currentMsgMarkup = JSON.parse(JSON.stringify(newMarkup));
-          if (message.reply_markup && message.reply_markup.inline_keyboard) {
-              const lastRow = message.reply_markup.inline_keyboard[message.reply_markup.inline_keyboard.length - 1];
-              if (lastRow && lastRow[0] && lastRow[0].url && lastRow[0].url.includes('t.me/c/')) {
-                  currentMsgMarkup.inline_keyboard.push(lastRow); 
-              }
-          }
-
-          await telegramApi(env.BOT_TOKEN, "editMessageReplyMarkup", {
-              chat_id: message.chat.id,
-              message_id: message.message_id,
-              reply_markup: currentMsgMarkup,
-          });
-
-          await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { 
-              callback_query_id: callbackQuery.id, 
-              text: isMuting ? "🔕 已静音该用户通知" : "🔔 已恢复该用户通知", 
-              show_alert: false 
-          });
-
-          // [⭐️ 核心同步逻辑]
-          const blockLogTopicId = await ensureBlockLogTopicExists(env);
-          const userTopicId = user.topic_id;
-          const infoCardMsgId = user.info_card_message_id;
-          const isClickedInUserTopic = topicId === userTopicId;
-
-          if (isClickedInUserTopic && blockLogTopicId) {
-              const cleanGroupId = env.ADMIN_GROUP_ID.toString().replace(/^-100/, '');
-              const jumpUrl = `https://t.me/c/${cleanGroupId}/${userTopicId}`;
-              let logMarkup = JSON.parse(JSON.stringify(newMarkup));
-              logMarkup.inline_keyboard.push([{ text: "💬 跳转到会话窗口", url: jumpUrl }]);
-              
-              const logText = `<b>${isMuting ? '🔕 用户被静音' : '🔔 用户已取消静音'}</b>\n` +
-                              `用户: <a href="tg://user?id=${userId}">${escapeHtml(userName)}</a>\n` +
-                              `ID: <code>${userId}</code>\n` +
-                              `操作人: ${escapeHtml(callbackQuery.from.first_name)}`;
-
-              // [⭐️ 新增] 尝试发送，如果失败(话题不存在)则重建并重试
-              const sendLogParams = {
-                  chat_id: env.ADMIN_GROUP_ID,
-                  message_thread_id: blockLogTopicId,
-                  text: logText,
-                  parse_mode: "HTML",
-                  reply_markup: logMarkup
-              };
-
-              try {
-                  await telegramApi(env.BOT_TOKEN, "sendMessage", sendLogParams);
-              } catch (e) {
-                  const errStr = e.message || e.toString();
-                  if (errStr.includes("thread not found") || errStr.includes("TOPIC_DELETED") || errStr.includes("Bad Request: message thread not found")) {
-                      console.warn("屏蔽/静音名单话题失效，尝试重建...");
-                      await env.TG_BOT_DB.prepare("DELETE FROM config WHERE key = ?").bind('user_block_log_topic_id').run();
-                      const newLogId = await ensureBlockLogTopicExists(env);
-                      if (newLogId) {
-                          sendLogParams.message_thread_id = newLogId;
-                          try {
-                              await telegramApi(env.BOT_TOKEN, "sendMessage", sendLogParams);
-                          } catch (retryErr) {
-                              console.error("重建话题后重试发送仍然失败:", retryErr);
-                          }
-                      }
-                  } else {
-                      console.error("发送静音日志失败:", e);
-                  }
-              }
-          } else if (!isClickedInUserTopic && infoCardMsgId) {
-               // ... (这部分保持不变)
-              try {
-                  await telegramApi(env.BOT_TOKEN, "editMessageReplyMarkup", {
-                      chat_id: env.ADMIN_GROUP_ID,
-                      message_id: infoCardMsgId,
-                      reply_markup: newMarkup,
-                  });
-              } catch (e) {
-                  console.warn("同步用户话题资料卡失败:", e.message);
-              }
-          }
-      } catch (e) { console.error(`处理 ${action} 操作失败:`, e.message); }
   }
-  // 3. 置顶操作
-  else if (action === 'pin_card') {
-      try {
-          await telegramApi(env.BOT_TOKEN, "pinChatMessage", {
-              chat_id: message.chat.id,
-              message_id: message.message_id,
-              message_thread_id: topicId,
-              disable_notification: true,
-          });
-          await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { 
-              callback_query_id: callbackQuery.id, 
-              text: "✅ 已置顶该资料卡。", 
-              show_alert: false 
-          });
-      } catch (e) {
-          await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { 
-              callback_query_id: callbackQuery.id, 
-              text: `❌ 置顶失败: ${e.message}`, 
-              show_alert: true 
-          });
-      }
-  }
-}
